@@ -4,7 +4,9 @@ const formatHostname = (hostname) => {
     domain = domain.substring(4);
   }
   const parts = domain.split('.');
-  if (parts.length > 1) {
+  if (parts.length > 2) {
+    domain = parts[parts.length - 2];
+  } else if (parts.length > 1) {
     domain = parts[0];
   }
   return domain.charAt(0).toUpperCase() + domain.slice(1);
