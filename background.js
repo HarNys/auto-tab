@@ -18,14 +18,29 @@ const updateGroupTitle = (groupId) => {
     return;
   }
   chrome.tabGroups.get(groupId, (group) => {
-    if (chrome.runtime.lastError) { return; }
+    if (chrome.runtime.lastError || !group) { return; }
     chrome.tabs.query({ groupId: groupId }, (tabs) => {
       // If the group is empty, it will be removed automatically. No need to update.
       if (tabs.length === 0) { return; } 
-      const baseTitle = group.title.split(' ')[0];
+      
+      let baseTitle = group.title.split(' ')[0];
+      
+      // Fallback if the title is empty or missing the hostname
+      if (!baseTitle && tabs[0].url) {
+        try {
+          baseTitle = formatHostname(new URL(tabs[0].url).hostname);
+        } catch (e) {
+          baseTitle = 'Group';
+        }
+      }
+
       const newTitle = `${baseTitle} [${tabs.length}]`;
       if (group.title !== newTitle) {
-        chrome.tabGroups.update(groupId, { title: newTitle });
+        // Including the color in the update can sometimes help force a UI refresh in Chrome
+        chrome.tabGroups.update(groupId, { 
+          title: newTitle,
+          color: group.color 
+        });
       }
     });
   });
@@ -36,29 +51,33 @@ const groupAllTabs = () => {
     if (data.autoGroupingEnabled === false) return;
     
     chrome.tabs.query({ windowType: 'normal' }, (tabs) => {
+      if (tabs.length === 0) return;
       const tabsByHostname = {};
       tabs.forEach(tab => {
         if (tab.url) {
-          const formatted = formatHostname(new URL(tab.url).hostname);
-          if (!tabsByHostname[formatted]) tabsByHostname[formatted] = [];
-          tabsByHostname[formatted].push(tab.id);
+          try {
+            const formatted = formatHostname(new URL(tab.url).hostname);
+            if (!tabsByHostname[formatted]) tabsByHostname[formatted] = [];
+            tabsByHostname[formatted].push(tab.id);
+          } catch (e) {}
         }
       });
 
-      for (const formattedHostname in tabsByHostname) {
-        const tabIds = tabsByHostname[formattedHostname];
-        chrome.tabGroups.query({ windowId: tabs[0].windowId }, (existingGroups) => {
-            const group = existingGroups.find(g => g.title.startsWith(formattedHostname));
-            if (group) {
-                chrome.tabs.group({ groupId: group.id, tabIds }, () => updateGroupTitle(group.id));
-            } else {
-                chrome.tabs.group({ tabIds }, (groupId) => {
-                    const newTitle = `${formattedHostname} [${tabIds.length}]`;
-                    chrome.tabGroups.update(groupId, { title: newTitle });
-                });
-            }
-        });
-      }
+      chrome.tabGroups.query({ windowId: tabs[0].windowId }, (existingGroups) => {
+        for (const formattedHostname in tabsByHostname) {
+          const tabIds = tabsByHostname[formattedHostname];
+          const group = existingGroups.find(g => g.title.startsWith(formattedHostname));
+          if (group) {
+            chrome.tabs.group({ groupId: group.id, tabIds }, () => updateGroupTitle(group.id));
+          } else {
+            chrome.tabs.group({ tabIds }, (groupId) => {
+              const newTitle = `${formattedHostname} [${tabIds.length}]`;
+              // Including a color helps force a UI refresh for the group title
+              chrome.tabGroups.update(groupId, { title: newTitle, color: 'grey' });
+            });
+          }
+        }
+      });
     });
   });
 };
@@ -72,7 +91,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       return;
     }
 
-    const formattedHostname = formatHostname(new URL(tab.url).hostname);
+    let formattedHostname;
+    try {
+      formattedHostname = formatHostname(new URL(tab.url).hostname);
+    } catch (e) {
+      return;
+    }
 
     chrome.tabGroups.query({ windowId: tab.windowId }, (allGroups) => {
       const groupForHostname = allGroups.find(g => g.title.startsWith(formattedHostname));
@@ -88,7 +112,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       } else {
         chrome.tabs.group({ tabIds: [tabId] }, (newGroupId) => {
           const newTitle = `${formattedHostname} [1]`;
-          chrome.tabGroups.update(newGroupId, { title: newTitle });
+          // Including a color helps force a UI refresh for the group title
+          chrome.tabGroups.update(newGroupId, { title: newTitle, color: 'blue' });
         });
       }
     });
