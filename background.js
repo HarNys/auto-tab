@@ -12,119 +12,136 @@ const formatHostname = (hostname) => {
   return domain.charAt(0).toUpperCase() + domain.slice(1);
 };
 
-const updateGroupTitle = (groupId) => {
+// Returns the group name for a tab, or null if the tab must not be grouped
+// (non-web URLs, pinned tabs, or tabs without a hostname).
+const getGroupName = (tab) => {
+  if (!tab.url || tab.pinned) return null;
+  try {
+    const url = new URL(tab.url);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    const name = formatHostname(url.hostname);
+    return name || null;
+  } catch (e) {
+    return null;
+  }
+};
+
+// Group titles look like "Name [3]"; extracts "Name".
+const groupName = (title) => {
+  const match = /^(.*) \[\d+\]$/.exec(title || '');
+  return match ? match[1] : null;
+};
+
+// Tab groups only exist in normal windows. Popups (e.g. OAuth login windows)
+// must never be touched: grouping them crashes the browser process.
+const isNormalWindow = async (windowId) => {
+  try {
+    const win = await chrome.windows.get(windowId);
+    return win.type === 'normal';
+  } catch (e) {
+    return false;
+  }
+};
+
+// All grouping work runs through one queue so concurrent tab events can't
+// race each other into creating duplicate groups.
+let queue = Promise.resolve();
+const enqueue = (task) => {
+  queue = queue.then(task).catch(() => {});
+  return queue;
+};
+
+const isEnabled = async () => {
+  const data = await chrome.storage.sync.get('autoGroupingEnabled');
+  return data.autoGroupingEnabled !== false;
+};
+
+const updateGroupTitle = async (groupId) => {
   if (groupId === null || groupId === undefined || groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
     return;
   }
-  
-  chrome.tabs.query({ groupId: groupId }, (tabs) => {
-    if (chrome.runtime.lastError || tabs.length === 0) return;
 
-    let hostname = 'Group';
-    try {
-      const counts = {};
-      tabs.forEach(t => {
-        if (t.url) {
-          try {
-            const h = formatHostname(new URL(t.url).hostname);
-            counts[h] = (counts[h] || 0) + 1;
-          } catch (e) {}
-        }
-      });
-      const sorted = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
-      if (sorted.length > 0) hostname = sorted[0];
-    } catch (e) {}
+  const tabs = await chrome.tabs.query({ groupId });
+  if (tabs.length === 0) return;
 
-    const newTitle = `${hostname} [${tabs.length}]`;
-    chrome.tabGroups.update(groupId, { title: newTitle });
+  const counts = {};
+  tabs.forEach(t => {
+    const name = getGroupName(t);
+    if (name) counts[name] = (counts[name] || 0) + 1;
   });
+  const sorted = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+  const hostname = sorted.length > 0 ? sorted[0] : 'Group';
+
+  const newTitle = `${hostname} [${tabs.length}]`;
+  const group = await chrome.tabGroups.get(groupId);
+  if (group.title !== newTitle) {
+    await chrome.tabGroups.update(groupId, { title: newTitle });
+  }
 };
 
-const groupAllTabs = () => {
-  chrome.storage.sync.get('autoGroupingEnabled', (data) => {
-    if (data.autoGroupingEnabled === false) return;
-    
-    chrome.tabs.query({ windowType: 'normal' }, (tabs) => {
-      if (tabs.length === 0) return;
-      const tabsByHostname = {};
-      tabs.forEach(tab => {
-        if (tab.url) {
-          try {
-            const formatted = formatHostname(new URL(tab.url).hostname);
-            if (!tabsByHostname[formatted]) tabsByHostname[formatted] = [];
-            tabsByHostname[formatted].push(tab.id);
-          } catch (e) {}
-        }
-      });
+const updateAllGroupTitles = () => enqueue(async () => {
+  const groups = await chrome.tabGroups.query({});
+  for (const group of groups) {
+    await updateGroupTitle(group.id);
+  }
+});
 
-      chrome.tabGroups.query({ windowId: tabs[0].windowId }, (existingGroups) => {
-        for (const formattedHostname in tabsByHostname) {
-          const tabIds = tabsByHostname[formattedHostname];
-          const group = existingGroups.find(g => g.title.startsWith(formattedHostname));
-          if (group) {
-            chrome.tabs.group({ groupId: group.id, tabIds }, () => updateGroupTitle(group.id));
-          } else {
-            chrome.tabs.group({ tabIds }, (groupId) => {
-              // Initial color set can help with visibility, but updateGroupTitle handles the name
-              chrome.tabGroups.update(groupId, { color: 'grey' }, () => updateGroupTitle(groupId));
-            });
-          }
-        }
-      });
+// Moves the given tabs into the group named `name` in their window, creating it if needed.
+const groupTabs = async (windowId, name, tabIds) => {
+  const groups = await chrome.tabGroups.query({ windowId });
+  const existing = groups.find(g => groupName(g.title) === name);
+  let groupId;
+  if (existing) {
+    groupId = await chrome.tabs.group({ groupId: existing.id, tabIds });
+  } else {
+    groupId = await chrome.tabs.group({ tabIds, createProperties: { windowId } });
+    await chrome.tabGroups.update(groupId, { color: 'grey', title: `${name} [${tabIds.length}]` });
+  }
+  await updateGroupTitle(groupId);
+};
+
+const groupAllTabs = () => enqueue(async () => {
+  if (!(await isEnabled())) return;
+
+  const windows = await chrome.windows.getAll({ windowTypes: ['normal'] });
+  for (const win of windows) {
+    const tabs = await chrome.tabs.query({ windowId: win.id });
+    const tabsByName = {};
+    tabs.forEach(tab => {
+      const name = getGroupName(tab);
+      if (!name) return;
+      (tabsByName[name] = tabsByName[name] || []).push(tab.id);
     });
-  });
-};
+
+    for (const name in tabsByName) {
+      await groupTabs(win.id, name, tabsByName[name]);
+    }
+  }
+});
 
 chrome.runtime.onInstalled.addListener(groupAllTabs);
 chrome.windows.onCreated.addListener(groupAllTabs);
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  chrome.storage.sync.get('autoGroupingEnabled', (data) => {
-    if (data.autoGroupingEnabled === false || changeInfo.status !== 'complete' || !tab.url) {
-      return;
-    }
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== 'complete') return;
 
-    let formattedHostname;
-    try {
-      formattedHostname = formatHostname(new URL(tab.url).hostname);
-    } catch (e) {
-      return;
-    }
+  enqueue(async () => {
+    if (!(await isEnabled())) return;
 
-    chrome.tabGroups.query({ windowId: tab.windowId }, (allGroups) => {
-      const groupForHostname = allGroups.find(g => g.title.startsWith(formattedHostname));
-      
-      if (groupForHostname) {
-        if (tab.groupId !== groupForHostname.id) {
-          chrome.tabs.group({ groupId: groupForHostname.id, tabIds: tabId }, () => {
-             updateGroupTitle(groupForHostname.id);
-          });
-        } else {
-          updateGroupTitle(tab.groupId);
-        }
-      } else {
-        chrome.tabs.group({ tabIds: [tabId] }, (newGroupId) => {
-          // Setting the initial color then delegating to updateGroupTitle for the name/delay
-          chrome.tabGroups.update(newGroupId, { color: 'blue' }, () => updateGroupTitle(newGroupId));
-        });
-      }
-    });
+    // The tab may have changed or closed while queued, so fetch its current state.
+    const tab = await chrome.tabs.get(tabId);
+    const name = getGroupName(tab);
+    if (!name || !(await isNormalWindow(tab.windowId))) return;
+
+    await groupTabs(tab.windowId, name, [tabId]);
   });
 });
-
-const updateAllGroupTitles = () => {
-    chrome.tabGroups.query({}, (groups) => {
-        for(const group of groups) {
-            updateGroupTitle(group.id);
-        }
-    });
-};
 
 chrome.tabs.onAttached.addListener(updateAllGroupTitles);
 chrome.tabs.onDetached.addListener(updateAllGroupTitles);
 
 chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-    if (!removeInfo.isWindowClosing) {
-        updateAllGroupTitles();
-    }
+  if (!removeInfo.isWindowClosing) {
+    updateAllGroupTitles();
+  }
 });
